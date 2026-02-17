@@ -1341,6 +1341,656 @@ class LightGlueMatcher(ImageMatcherBase):
 
         return True
 
+@dataclass
+class SurvivingFeatures:
+    """Container for accumulated surviving features across multiple images."""
+    keypoints: torch.Tensor  # (1, N, 2)
+    scores: torch.Tensor  # (1, N)
+    descriptors: torch.Tensor  # (1, N, descriptor_dim)
+    image_size: torch.Tensor  # (1, 2) - [height, width]
+    source_image: str = None  # Track which image these features came from
+    
+    def to_device(self, device):
+        """Move all tensors to specified device."""
+        return SurvivingFeatures(
+            keypoints=self.keypoints.to(device),
+            scores=self.scores.to(device),
+            descriptors=self.descriptors.to(device),
+            image_size=self.image_size.to(device),
+            source_image=self.source_image
+        )
+    
+    def accumulate(self, new_features: 'SurvivingFeatures') -> 'SurvivingFeatures':
+        """Concatenate new surviving features with existing ones."""
+        return SurvivingFeatures(
+            keypoints=torch.cat([self.keypoints, new_features.keypoints], dim=1),
+            scores=torch.cat([self.scores, new_features.scores], dim=1),
+            descriptors=torch.cat([self.descriptors, new_features.descriptors], dim=1),
+            image_size=self.image_size,  # Keep original image size
+            source_image=self.source_image
+        )
+    
+    def __len__(self):
+        return self.keypoints.shape[1]
+
+
+class SurvivingFeaturesMatcher(ImageMatcherBase):
+    """
+    Matcher using surviving features method for sequential time-lapse image alignment.
+    
+    Key differences from HomographyMatcher:
+    1. Accumulates features across multiple images (not just iterative refinement)
+    2. Designed for long time-series with camera movement
+    3. Combines fresh matches with survivor matches for robustness
+    4. Includes fallback strategies for difficult pairs
+    
+    Workflow:
+        Image0 -> Image1: Fresh match -> Align -> Store survivors
+        Image1 -> Image2: Fresh match + Survivor match -> Align -> Accumulate survivors
+        Image2 -> Image3: Fresh match + Survivor match -> Align -> Accumulate survivors
+        ...
+    """
+    
+    def __init__(self, opt: dict = {}) -> None:
+        """
+        Initialize SurvivingFeaturesMatcher.
+        
+        Args:
+            opt: Configuration dictionary:
+                - base_matcher: "lightglue", "superglue" (default: "lightglue")
+                - extractor: "superpoint", "disk" (default: "superpoint")
+                - homography_method: "USAC_MAGSAC" or "RANSAC" (default: "USAC_MAGSAC")
+                - reproj_threshold: RANSAC threshold in pixels (default: 2.0)
+                - confidence: RANSAC confidence (default: 0.995)
+                - max_iters: Max RANSAC iterations (default: 5000)
+                - min_matches_fresh: Min matches for fresh matching (default: 100)
+                - min_matches_survivor: Min matches for survivor matching (default: 50)
+                - enable_survivor_matching: Enable survivor feature matching (default: True)
+                - accumulate_survivors: Accumulate survivors across images (default: True)
+                - max_survivor_features: Max accumulated features (default: 5000)
+                - enable_tiling: Use tiling for large images (default: False)
+                - alignment_quality: Quality for alignment (default: Quality.HIGH)
+                - visualization_folder: Path to save visualizations (default: None)
+        """
+        super().__init__(opt)
+        
+        # Initialize LightGlue/SuperGlue components
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.set_grad_enabled(False)
+        
+        extractor_type = opt.get("extractor", "superpoint")
+        if extractor_type == "superpoint":
+            from icepy4d.thirdparty.LightGlue.lightglue import SuperPoint
+            self._extractor = SuperPoint(max_num_keypoints=opt.get("max_keypoints", None)).to(self.device)
+        elif extractor_type == "disk":
+            from icepy4d.thirdparty.LightGlue.lightglue import DISK
+            self._extractor = DISK(max_num_keypoints=opt.get("max_keypoints", None)).to(self.device)
+        else:
+            raise ValueError(f"Unknown extractor: {extractor_type}")
+        
+        from icepy4d.thirdparty.LightGlue.lightglue import LightGlue
+        self._matcher = LightGlue(
+            features=extractor_type,
+            depth_confidence=-1,
+            width_confidence=-1,
+            filter_threshold=opt.get("filter_threshold", 0.6)
+        ).to(self.device)
+        
+        # Homography parameters
+        self._homography_method = opt.get("homography_method", "USAC_MAGSAC")
+        self._reproj_threshold = opt.get("reproj_threshold", 2.0)
+        self._confidence = opt.get("confidence", 0.995)
+        self._max_iters = opt.get("max_iters", 5000)
+        
+        # Matching thresholds
+        self._min_matches_fresh = opt.get("min_matches_fresh", 100)
+        self._min_matches_survivor = opt.get("min_matches_survivor", 50)
+        
+        # Surviving features configuration
+        self._enable_survivor_matching = opt.get("enable_survivor_matching", True)
+        self._accumulate_survivors = opt.get("accumulate_survivors", True)
+        self._max_survivor_features = opt.get("max_survivor_features", 5000)
+        
+        # Tiling configuration
+        self._enable_tiling = opt.get("enable_tiling", False)
+        self._alignment_quality = opt.get("alignment_quality", Quality.HIGH)
+        
+        # Visualization
+        self._visualization_folder = opt.get("visualization_folder", None)
+        if self._visualization_folder:
+            Path(self._visualization_folder).mkdir(parents=True, exist_ok=True)
+        
+        # State tracking
+        self._surviving_features: SurvivingFeatures = None
+        self._reference_image_path: str = None
+        self._cumulative_homography: np.ndarray = np.eye(3)
+        self._sequence_index: int = 0
+        self._movement_magnitudes: List[float] = []
+        
+    def reset_sequence(self):
+        """Reset all accumulated state for a new image sequence."""
+        self._surviving_features = None
+        self._reference_image_path = None
+        self._cumulative_homography = np.eye(3)
+        self._sequence_index = 0
+        self._movement_magnitudes = []
+        logger.info("Sequence state reset")
+    
+    @property
+    def surviving_features(self) -> SurvivingFeatures:
+        """Return current accumulated surviving features."""
+        return self._surviving_features
+    
+    @property
+    def movement_magnitudes(self) -> List[float]:
+        """Return list of movement magnitudes for each processed image."""
+        return self._movement_magnitudes
+    
+    def _load_image_tensor(self, image_path: str) -> torch.Tensor:
+        """Load image as tensor for LightGlue."""
+        from icepy4d.thirdparty.LightGlue.lightglue.utils import load_image
+        return load_image(image_path).to(self.device)
+    
+    def _verify_geometry(
+        self,
+        kpts0: np.ndarray,
+        kpts1: np.ndarray,
+    ) -> dict:
+        """
+        Geometric verification using homography RANSAC.
+        
+        Returns dict with:
+            - model: Homography matrix (3x3)
+            - inliers_mask: Boolean array
+            - metrics: Dict with num_inliers, inlier_ratio, reproj_error
+            - kpts0_inliers_np: Inlier keypoints from image0
+            - kpts1_inliers_np: Inlier keypoints from image1
+        """
+        # Convert to numpy if needed
+        if hasattr(kpts0, 'cpu'):
+            kpts0 = kpts0.cpu().numpy().astype(np.float32)
+            kpts1 = kpts1.cpu().numpy().astype(np.float32)
+        else:
+            kpts0 = np.asarray(kpts0, dtype=np.float32)
+            kpts1 = np.asarray(kpts1, dtype=np.float32)
+        
+        # Find homography
+        algo = cv2.USAC_MAGSAC if self._homography_method == 'USAC_MAGSAC' else cv2.RANSAC
+        H, mask = cv2.findHomography(
+            kpts1, kpts0, algo,
+            self._reproj_threshold,
+            self._confidence,
+            self._max_iters
+        )
+        
+        if mask is None:
+            inliers = np.zeros(len(kpts0), dtype=bool)
+        else:
+            inliers = mask.ravel().astype(bool)
+        
+        # Compute metrics
+        metrics = {
+            'num_inliers': int(inliers.sum()),
+            'inlier_ratio': float(inliers.sum()) / max(1, len(inliers))
+        }
+        
+        if H is not None and inliers.sum() > 0:
+            warped = cv2.perspectiveTransform(kpts1.reshape(-1, 1, 2), H).reshape(-1, 2)
+            err = np.linalg.norm(warped - kpts0, axis=1)
+            err_in = err[inliers]
+            metrics['reproj_error_mean'] = float(err_in.mean()) if err_in.size else None
+            metrics['reproj_error_median'] = float(np.median(err_in)) if err_in.size else None
+        
+        return {
+            'model': H,
+            'inliers_mask': inliers,
+            'metrics': metrics,
+            'kpts0_inliers_np': kpts0[inliers],
+            'kpts1_inliers_np': kpts1[inliers]
+        }
+    
+    def _match_fresh(
+        self,
+        image0_path: str,
+        image1_path: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, SurvivingFeatures]:
+        """
+        Fresh matching between two images (extract features from both).
+        
+        Returns:
+            - m_kpts0_inliers: Matched keypoints in image0 after geometric verification
+            - m_kpts1_inliers: Matched keypoints in image1 after geometric verification
+            - survivor_feats: Surviving features from image0 (geometrically verified)
+        """
+        logger.info(f"Fresh matching: {Path(image0_path).name} -> {Path(image1_path).name}")
+        
+        # Load images
+        img0_tensor = self._load_image_tensor(image0_path)
+        img1_tensor = self._load_image_tensor(image1_path)
+        
+        # Extract features
+        feats0 = self._extractor.extract(img0_tensor)
+        feats1 = self._extractor.extract(img1_tensor)
+        
+        # Match features
+        from icepy4d.thirdparty.LightGlue.lightglue.utils import rbd
+        matches01 = self._matcher({"image0": feats0, "image1": feats1})
+        
+        # Move to CPU
+        feats0, feats1, matches01 = [rbd(x) for x in [feats0, feats1, matches01]]
+        
+        # Get matched keypoints
+        kpts0 = feats0["keypoints"]
+        kpts1 = feats1["keypoints"]
+        matches = matches01["matches"]
+        m_kpts0 = kpts0[matches[..., 0]]
+        m_kpts1 = kpts1[matches[..., 1]]
+        
+        logger.info(f"  Initial matches: {len(m_kpts0)}")
+        
+        # Geometric verification
+        geo_result = self._verify_geometry(m_kpts0, m_kpts1)
+        logger.info(f"  After geometric verification: {geo_result['metrics']['num_inliers']} inliers "
+                   f"({geo_result['metrics']['inlier_ratio']:.2%})")
+        
+        if geo_result['metrics']['reproj_error_mean'] is not None:
+            logger.info(f"  Reprojection error: {geo_result['metrics']['reproj_error_mean']:.2f}px "
+                       f"(median: {geo_result['metrics']['reproj_error_median']:.2f}px)")
+        
+        # Extract inliers
+        inlier_mask = geo_result['inliers_mask']
+        m_kpts0_inliers = torch.from_numpy(geo_result['kpts0_inliers_np'])
+        m_kpts1_inliers = torch.from_numpy(geo_result['kpts1_inliers_np'])
+        
+        # Build surviving features from image0 inliers
+        valid_matches = matches01['matches0'] > -1
+        valid_indices = torch.where(valid_matches)[0]
+        inlier_indices = valid_indices[torch.from_numpy(inlier_mask)]
+        
+        survivor_feats = SurvivingFeatures(
+            keypoints=feats0['keypoints'][inlier_indices].unsqueeze(0),
+            scores=feats0['keypoint_scores'][inlier_indices].unsqueeze(0),
+            descriptors=feats0['descriptors'][inlier_indices].unsqueeze(0),
+            image_size=feats0['image_size'].unsqueeze(0),
+            source_image=image0_path
+        )
+        
+        return m_kpts0_inliers, m_kpts1_inliers, survivor_feats
+    
+    def _match_survivor(
+        self,
+        survivor_feats: SurvivingFeatures,
+        image1_path: str,
+    ) -> Tuple[torch.Tensor, SurvivingFeatures]:
+        """
+        Match surviving features against new image.
+        
+        Returns:
+            - m_kpts0_inliers: Matched survivor keypoints after geometric verification
+            - new_survivor_feats: Updated surviving features (geometrically verified subset)
+        """
+        logger.info(f"Survivor matching: {len(survivor_feats)} features -> {Path(image1_path).name}")
+        
+        # Load target image
+        img1_tensor = self._load_image_tensor(image1_path)
+        
+        # Extract features from image1
+        feats1 = self._extractor.extract(img1_tensor)
+        
+        # Match survivor features with image1 features
+        survivor_feats_device = survivor_feats.to_device(self.device)
+        matches01 = self._matcher({
+            "image0": {
+                'keypoints': survivor_feats_device.keypoints,
+                'keypoint_scores': survivor_feats_device.scores,
+                'descriptors': survivor_feats_device.descriptors,
+                'image_size': survivor_feats_device.image_size
+            },
+            "image1": feats1
+        })
+        
+        # Move to CPU
+        from icepy4d.thirdparty.LightGlue.lightglue.utils import rbd
+        feats0_dict = {
+            'keypoints': survivor_feats.keypoints,
+            'keypoint_scores': survivor_feats.scores,
+            'descriptors': survivor_feats.descriptors,
+            'image_size': survivor_feats.image_size
+        }
+        feats0_dict, feats1, matches01 = [rbd(x) for x in [feats0_dict, feats1, matches01]]
+        
+        # Get matched keypoints
+        kpts0 = feats0_dict["keypoints"]
+        kpts1 = feats1["keypoints"]
+        matches = matches01["matches"]
+        m_kpts0 = kpts0[matches[..., 0]]
+        m_kpts1 = kpts1[matches[..., 1]]
+        
+        logger.info(f"  Initial survivor matches: {len(m_kpts0)}")
+        
+        # Geometric verification
+        geo_result = self._verify_geometry(m_kpts0, m_kpts1)
+        logger.info(f"  After geometric verification: {geo_result['metrics']['num_inliers']} inliers "
+                   f"({geo_result['metrics']['inlier_ratio']:.2%})")
+        
+        # Extract inliers
+        inlier_mask = geo_result['inliers_mask']
+        m_kpts0_inliers = torch.from_numpy(geo_result['kpts0_inliers_np'])
+        
+        # Build updated surviving features (only geometrically verified ones)
+        valid_matches = matches01['matches0'] > -1
+        valid_indices = torch.where(valid_matches)[0]
+        inlier_indices = valid_indices[torch.from_numpy(inlier_mask)]
+        
+        new_survivor_feats = SurvivingFeatures(
+            keypoints=feats0_dict['keypoints'][inlier_indices].unsqueeze(0),
+            scores=feats0_dict['keypoint_scores'][inlier_indices].unsqueeze(0),
+            descriptors=feats0_dict['descriptors'][inlier_indices].unsqueeze(0),
+            image_size=feats0_dict['image_size'].unsqueeze(0),
+            source_image=survivor_feats.source_image
+        )
+        
+        return m_kpts0_inliers, new_survivor_feats
+    
+    def _compute_movement_magnitude(self, H: np.ndarray, width: int, height: int) -> float:
+        """Compute average displacement of image corners under homography."""
+        if H is None:
+            return None
+        
+        corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]]).reshape(-1, 1, 2)
+        warped_corners = cv2.perspectiveTransform(corners, H)
+        distances = np.linalg.norm(corners - warped_corners, axis=2)
+        return float(np.mean(distances))
+    
+    def _align_image(
+        self,
+        image_path: str,
+        kpts_ref: np.ndarray,
+        kpts_target: np.ndarray,
+        output_folder: str,
+    ) -> Tuple[str, float, np.ndarray]:
+        """
+        Align target image to reference using homography.
+        
+        Returns:
+            - aligned_image_path: Path to saved aligned image
+            - movement_magnitude: Average pixel displacement
+            - H: Homography matrix
+        """
+        # Read image
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Failed to load image: {image_path}")
+        h, w = img.shape[:2]
+        
+        # Convert keypoints to numpy if needed
+        if hasattr(kpts_ref, 'cpu'):
+            kpts_ref = kpts_ref.cpu().numpy().astype(np.float32)
+            kpts_target = kpts_target.cpu().numpy().astype(np.float32)
+        
+        # Estimate homography
+        algo = cv2.USAC_MAGSAC if self._homography_method == 'USAC_MAGSAC' else cv2.RANSAC
+        H, _ = cv2.findHomography(
+            kpts_target, kpts_ref, algo,
+            self._reproj_threshold,
+            self._confidence,
+            self._max_iters
+        )
+        
+        if H is None:
+            logger.warning("Homography estimation failed for alignment")
+            return None, None, None
+        
+        # Compute movement magnitude
+        magnitude = self._compute_movement_magnitude(H, w, h)
+        logger.info(f"  Movement magnitude: {magnitude:.2f}px")
+        
+        # Warp image
+        aligned_img = cv2.warpPerspective(img, H, (w, h))
+        
+        # Save aligned image
+        output_path = Path(output_folder)
+        output_path.mkdir(parents=True, exist_ok=True)
+        aligned_filename = output_path / f"aligned_{Path(image_path).name}"
+        cv2.imwrite(str(aligned_filename), aligned_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        
+        # Save visualization if requested
+        if self._visualization_folder:
+            self._save_match_visualization(
+                aligned_img, kpts_ref,
+                Path(image_path).name
+            )
+        
+        return str(aligned_filename), magnitude, H
+    
+    def _save_match_visualization(
+        self,
+        image: np.ndarray,
+        keypoints: np.ndarray,
+        image_name: str,
+    ):
+        """Save visualization of matched keypoints on aligned image."""
+        vis_folder = Path(self._visualization_folder) / "matches"
+        vis_folder.mkdir(parents=True, exist_ok=True)
+        
+        vis_img = image.copy()
+        if hasattr(keypoints, 'cpu'):
+            keypoints = keypoints.cpu().numpy()
+        
+        for kpt in keypoints:
+            x, y = int(kpt[0]), int(kpt[1])
+            cv2.circle(vis_img, (x, y), 3, (0, 255, 0), -1)
+            cv2.circle(vis_img, (x, y), 5, (0, 255, 0), 1)
+        
+        vis_path = vis_folder / f"matches_{image_name}"
+        cv2.imwrite(str(vis_path), vis_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    
+    def process_image_sequence(
+        self,
+        image_paths: List[str],
+        output_folder: str,
+        start_index: int = 0,
+        fallback_strategy: str = "skip",  # "skip", "neighbor", or "reset"
+    ) -> dict:
+        """
+        Process a sequence of images with surviving features accumulation.
+        
+        Args:
+            image_paths: List of image file paths in temporal order
+            output_folder: Directory to save aligned images
+            start_index: Index to start processing from (default: 0)
+            fallback_strategy: Strategy when matching fails:
+                - "skip": Skip the problematic image
+                - "neighbor": Try matching with temporal neighbors
+                - "reset": Reset survivors and start fresh
+        
+        Returns:
+            Dictionary with processing results:
+                - aligned_images: List of aligned image paths
+                - movement_magnitudes: List of movement magnitudes
+                - failed_images: List of images that failed to align
+                - num_survivors: Final number of accumulated survivors
+        """
+        logger.info(f"Processing sequence of {len(image_paths)} images")
+        logger.info(f"Output folder: {output_folder}")
+        logger.info(f"Fallback strategy: {fallback_strategy}")
+        
+        aligned_images = []
+        failed_images = []
+        
+        for i, image_path in enumerate(image_paths):
+            logger.info(f"\n=== Processing image {i+1}/{len(image_paths)}: {Path(image_path).name} ===")
+            
+            try:
+                if i == 0:
+                    # First image: just store as reference
+                    self._reference_image_path = image_path
+                    self._sequence_index = i
+                    aligned_images.append(image_path)
+                    logger.info("  → Set as reference image")
+                    
+                elif i == 1:
+                    # Second image: fresh match with first
+                    m_kpts0, m_kpts1, survivor_feats = self._match_fresh(
+                        self._reference_image_path,
+                        image_path
+                    )
+                    
+                    if len(m_kpts0) < self._min_matches_fresh:
+                        raise ValueError(f"Insufficient matches: {len(m_kpts0)} < {self._min_matches_fresh}")
+                    
+                    # Align and save
+                    aligned_path, magnitude, H = self._align_image(
+                        image_path, m_kpts0, m_kpts1, output_folder
+                    )
+                    
+                    if aligned_path:
+                        aligned_images.append(aligned_path)
+                        self._movement_magnitudes.append(magnitude)
+                        self._surviving_features = survivor_feats
+                        self._reference_image_path = aligned_path
+                        self._sequence_index = i
+                        logger.info(f"  ✓ Aligned successfully, {len(survivor_feats)} survivors")
+                    
+                else:
+                    # Subsequent images: fresh + survivor matching
+                    
+                    # 1. Fresh matching with previous aligned image
+                    m_kpts0_fresh, m_kpts1_fresh, survivor_feats_fresh = self._match_fresh(
+                        self._reference_image_path,
+                        image_path
+                    )
+                    
+                    logger.info(f"  Fresh matches: {len(m_kpts0_fresh)}")
+                    
+                    if len(m_kpts0_fresh) < self._min_matches_fresh:
+                        logger.warning(f"  Insufficient fresh matches: {len(m_kpts0_fresh)} < {self._min_matches_fresh}")
+                        
+                        if fallback_strategy == "skip":
+                            failed_images.append(image_path)
+                            continue
+                        elif fallback_strategy == "reset":
+                            logger.info("  Resetting survivors and starting fresh")
+                            self._surviving_features = None
+                            m_kpts0_fresh, m_kpts1_fresh, survivor_feats_fresh = self._match_fresh(
+                                image_paths[i-1], image_path
+                            )
+                        # TODO: Implement neighbor fallback strategy
+                    
+                    # 2. Survivor matching (if enabled and survivors exist)
+                    m_kpts0_survivor = None
+                    survivor_feats_survivor = None
+                    
+                    if (self._enable_survivor_matching and 
+                        self._surviving_features is not None and
+                        len(self._surviving_features) >= self._min_matches_survivor):
+                        
+                        m_kpts0_survivor, survivor_feats_survivor = self._match_survivor(
+                            self._surviving_features,
+                            image_path
+                        )
+                        logger.info(f"  Survivor matches: {len(m_kpts0_survivor)}")
+                    
+                    # 3. Use fresh matches for alignment (more robust for moving camera)
+                    aligned_path, magnitude, H = self._align_image(
+                        image_path, m_kpts0_fresh, m_kpts1_fresh, output_folder
+                    )
+                    
+                    if aligned_path:
+                        aligned_images.append(aligned_path)
+                        self._movement_magnitudes.append(magnitude)
+                        
+                        # 4. Accumulate survivors if enabled
+                        if self._accumulate_survivors:
+                            if survivor_feats_survivor is not None:
+                                # Combine fresh survivors with filtered existing survivors
+                                self._surviving_features = survivor_feats_fresh.accumulate(survivor_feats_survivor)
+                                logger.info(f"  Accumulated survivors: {len(self._surviving_features)}")
+                                
+                                # Limit number of survivors
+                                if len(self._surviving_features) > self._max_survivor_features:
+                                    # Keep highest scoring features
+                                    scores = self._surviving_features.scores.squeeze()
+                                    top_k_indices = torch.topk(scores, self._max_survivor_features).indices
+                                    self._surviving_features = SurvivingFeatures(
+                                        keypoints=self._surviving_features.keypoints[:, top_k_indices, :],
+                                        scores=self._surviving_features.scores[:, top_k_indices],
+                                        descriptors=self._surviving_features.descriptors[:, top_k_indices, :],
+                                        image_size=self._surviving_features.image_size,
+                                        source_image=self._surviving_features.source_image
+                                    )
+                                    logger.info(f"  Pruned to {len(self._surviving_features)} top survivors")
+                            else:
+                                # Only fresh survivors
+                                self._surviving_features = survivor_feats_fresh
+                                logger.info(f"  Updated survivors: {len(self._surviving_features)}")
+                        else:
+                            # Replace survivors with fresh ones
+                            self._surviving_features = survivor_feats_fresh
+                        
+                        self._reference_image_path = aligned_path
+                        self._sequence_index = i
+                        logger.info(f"  ✓ Successfully processed")
+                    else:
+                        failed_images.append(image_path)
+                        logger.warning(f"  ✗ Alignment failed")
+                        
+            except Exception as e:
+                logger.error(f"  ✗ Error processing {Path(image_path).name}: {e}")
+                failed_images.append(image_path)
+                if fallback_strategy == "reset":
+                    self._surviving_features = None
+        
+        # Return results
+        results = {
+            'aligned_images': aligned_images,
+            'movement_magnitudes': self._movement_magnitudes,
+            'failed_images': failed_images,
+            'num_survivors': len(self._surviving_features) if self._surviving_features else 0,
+            'sequence_length': len(image_paths),
+            'success_rate': len(aligned_images) / len(image_paths)
+        }
+        
+        logger.info(f"\n=== Sequence Processing Complete ===")
+        logger.info(f"Successfully aligned: {len(aligned_images)}/{len(image_paths)} images")
+        logger.info(f"Failed: {len(failed_images)} images")
+        logger.info(f"Final survivors: {results['num_survivors']}")
+        
+        return results
+    
+    def plot_movement_statistics(self, save_path: str = None):
+        """Plot movement magnitude over time."""
+        import matplotlib.pyplot as plt
+        
+        if not self._movement_magnitudes:
+            logger.warning("No movement data to plot")
+            return
+        
+        plt.figure(figsize=(12, 6))
+        plt.scatter(range(len(self._movement_magnitudes)), self._movement_magnitudes, alpha=0.6, s=50)
+        plt.xlabel('Image Index', fontsize=12)
+        plt.ylabel('Movement Magnitude (pixels)', fontsize=12)
+        plt.title('Image Movement Magnitudes Over Time', fontsize=14)
+        plt.grid(True, alpha=0.3)
+        
+        # Add statistics text
+        stats_text = (
+            f"Mean: {np.mean(self._movement_magnitudes):.2f}px\n"
+            f"Median: {np.median(self._movement_magnitudes):.2f}px\n"
+            f"Max: {np.max(self._movement_magnitudes):.2f}px\n"
+            f"Std: {np.std(self._movement_magnitudes):.2f}px"
+        )
+        plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Movement plot saved to {save_path}")
+        
+        plt.show()
+
 if __name__ == "__main__":
 
     from icepy4d.utils.logger import setup_logger
